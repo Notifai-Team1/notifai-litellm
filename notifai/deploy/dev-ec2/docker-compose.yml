@@ -1,0 +1,30 @@
+# LiteLLM en el EC2 de dev. Lo levanta deploy.sh con la imagen oficial copiada a
+# ECR. Las variables vienen del .env del host (notifai/deploy/dev-ec2/.env.example),
+# de upstream-image.env y del entorno de deploy.sh; ninguna tiene valor por
+# defecto. Runbook: notifai/deploy/dev-ec2/README.md.
+
+services:
+  litellm:
+    image: ${NOTIFAI_REGISTRY:?}/litellm-dev:${LITELLM_TAG:?}
+    command: ["--port", "4000", "--config", "/app/config.yaml", "--num_workers", "1"]
+    env_file: ${NOTIFAI_SERVICE_DIR:?}/.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?}
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    ports:
+      - "${NOTIFAI_BIND_ADDR:?}:${LITELLM_PORT:?}:4000"
+    mem_limit: 1g
+    mem_reservation: 512m
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://litellm:4000/health/liveliness', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    restart: unless-stopped

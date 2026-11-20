@@ -1,0 +1,157 @@
+# Despliega LiteLLM al EC2 de dev. No compila LiteLLM: copia a ECR la imagen
+# oficial fijada en notifai/deploy/dev-ec2/upstream-image.env y despliega por SSM
+# el bundle (compose, config y script) de este commit. Corre en cada push a
+# litellm_internal_staging que toque notifai/** o este workflow, y a demanda.
+# Es independiente de voicebot y de Chatwoot. Runbook: notifai/deploy/dev-ec2/README.md.
+name: Notifai deploy a dev
+
+on:
+  push:
+    branches: [litellm_internal_staging]
+    paths:
+      - "notifai/**"
+      - ".github/workflows/notifai-deploy-dev.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: notifai-deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/litellm_internal_staging'
+    runs-on: ubuntu-24.04
+    environment: dev
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validar el commit y la imagen fijada
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "el SHA no tiene la forma de 40 caracteres hexadecimales en minúscula" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/litellm_internal_staging 2>/dev/null; then
+            echo "el SHA $GITHUB_SHA no es ancestro de origin/litellm_internal_staging" >&2
+            exit 1
+          fi
+          missing=0
+          for path in docker-compose.yml litellm-config.yaml upstream-image.env deploy.sh bundle.Dockerfile; do
+            if [[ ! -f "notifai/deploy/dev-ec2/$path" ]]; then
+              echo "falta notifai/deploy/dev-ec2/$path" >&2
+              missing=1
+            fi
+          done
+          [[ "$missing" -eq 0 ]] || exit 1
+          file=notifai/deploy/dev-ec2/upstream-image.env
+          [[ "$(grep -c '^LITELLM_TAG=' "$file")" -eq 1 && "$(grep -c '^LITELLM_DIGEST=' "$file")" -eq 1 ]] || {
+            echo "$file tiene que tener exactamente una línea LITELLM_TAG y una LITELLM_DIGEST" >&2
+            exit 1
+          }
+          tag=$(sed -n 's/^LITELLM_TAG=//p' "$file")
+          digest=$(sed -n 's/^LITELLM_DIGEST=//p' "$file")
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-lts)?$ ]]; then
+            echo "LITELLM_TAG no es una versión estable X.Y.Z o X.Y.Z-lts" >&2
+            exit 1
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "LITELLM_DIGEST no tiene la forma sha256:<64 hexadecimales>" >&2
+            exit 1
+          fi
+          {
+            echo "SHA=$GITHUB_SHA"
+            echo "LITELLM_TAG=$tag"
+            echo "LITELLM_DIGEST=$digest"
+          } >> "$GITHUB_ENV"
+
+      - name: Credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.NOTIFAI_DEV_DEPLOY_ROLE }}
+          aws-region: ${{ vars.NOTIFAI_DEV_AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Registro
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Builder de BuildKit
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+
+      - name: Copiar la imagen oficial de LiteLLM a ECR
+        shell: bash
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          origen="ghcr.io/berriai/litellm:${LITELLM_TAG}@${LITELLM_DIGEST}"
+          destino="$REGISTRY/litellm-dev:$LITELLM_TAG"
+          if publicado=$(docker buildx imagetools inspect "$destino" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+            if [[ "$publicado" != "$LITELLM_DIGEST" ]]; then
+              echo "litellm-dev:$LITELLM_TAG ya existe con otro digest que el fijado en upstream-image.env" >&2
+              exit 1
+            fi
+            echo "litellm-dev:$LITELLM_TAG ya está publicada con el digest fijado: no se copia otra vez"
+            exit 0
+          fi
+          docker buildx imagetools create --tag "$destino" "$origen"
+          copiado=$(docker buildx imagetools inspect "$destino" --format '{{.Manifest.Digest}}')
+          if [[ "$copiado" != "$LITELLM_DIGEST" ]]; then
+            echo "el digest copiado a ECR no es el fijado en upstream-image.env" >&2
+            exit 1
+          fi
+
+      - name: Publicar el bundle del SHA
+        shell: bash
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          image="$REGISTRY/litellm-deploy-dev:$SHA"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "litellm-deploy-dev:$SHA ya está publicada: no se construye otra vez"
+            exit 0
+          fi
+          docker buildx build --push --file notifai/deploy/dev-ec2/bundle.Dockerfile --tag "$image" notifai/deploy/dev-ec2
+
+      - name: Desplegar en el EC2 de dev
+        shell: bash
+        env:
+          INSTANCE_ID: ${{ vars.NOTIFAI_DEV_INSTANCE_ID }}
+        run: |
+          command_id=$(aws ssm send-command \
+            --document-name notifai-dev-deploy-litellm \
+            --instance-ids "$INSTANCE_ID" \
+            --parameters "Sha=$SHA" \
+            --query Command.CommandId --output text)
+          echo "Comando de SSM: $command_id"
+          # La salida del comando del host no se imprime: solo el estado y el código.
+          # Cada vuelta espera con aws ssm wait, que ya tiene su propio tope; el de
+          # las vueltas y el timeout-minutes del job acotan el total.
+          for _ in $(seq 1 45); do
+            aws ssm wait command-executed --command-id "$command_id" --instance-id "$INSTANCE_ID" >/dev/null 2>&1 || true
+            if ! result=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+                --query '[Status, ResponseCode]' --output text 2>/dev/null); then
+              continue
+            fi
+            read -r status code <<< "$result"
+            case "$status" in
+              Pending|InProgress|Delayed) continue ;;
+            esac
+            echo "Estado: $status. Código de respuesta: $code"
+            [[ "$status" == "Success" ]]
+            exit $?
+          done
+          echo "el comando de SSM no terminó dentro del tope" >&2
+          exit 1

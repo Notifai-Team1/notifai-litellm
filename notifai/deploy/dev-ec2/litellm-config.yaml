@@ -1,0 +1,53 @@
+# Ruteo por comodines: LiteLLM manda cada modelo que pide el consumidor al
+# proveedor que corresponde, sin listar modelos. Los consumidores piden ids sin
+# prefijo (gpt-4.1-mini, text-embedding-3-small, gemini-2.5-pro) y los ids de
+# Flows con prefijo de proveedor; cada proveedor tiene las dos formas. Las
+# claves de los proveedores y la master key vienen del entorno del contenedor.
+model_list:
+  - model_name: "openai/*"
+    litellm_params:
+      model: "openai/*"
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: "gpt-*"
+    litellm_params:
+      model: "openai/gpt-*"
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: "text-embedding-*"
+    litellm_params:
+      model: "openai/text-embedding-*"
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: "whisper-*"
+    litellm_params:
+      model: "openai/whisper-*"
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: "tts-*"
+    litellm_params:
+      model: "openai/tts-*"
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: "gemini/*"
+    litellm_params:
+      model: "gemini/*"
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: "gemini-*"
+    litellm_params:
+      model: "gemini/gemini-*"
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: "anthropic/*"
+    litellm_params:
+      model: "anthropic/*"
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: "claude-*"
+    litellm_params:
+      model: "anthropic/claude-*"
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: "cohere/*"
+    litellm_params:
+      model: "cohere/*"
+      api_key: os.environ/COHERE_API_KEY
+  - model_name: "rerank-*"
+    litellm_params:
+      model: "cohere/rerank-*"
+      api_key: os.environ/COHERE_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
